@@ -32,5 +32,6 @@ task 'final', step2: STDIN do
     while read -r line; do
       echo "f> $line" >&2
     done
+    echo DONE
   EOF
 end
