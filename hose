@@ -209,7 +209,7 @@ module Hose
       stdin = opts.delete(:in)
       files = Array(opts.delete(:files))
       if opts.size > 0
-        raise "不明なオプション #{opts.keys,join(', ')} @ #{name}"
+        raise "不明なオプション #{opts.keys.join(', ')} @ #{name}"
       end
       Task.tasks[name] = Task.new(name, stdin, files, block)
     end
