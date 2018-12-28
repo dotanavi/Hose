@@ -29,7 +29,7 @@ module Hose
   #
   # Hosefileで定義されるタスクを表現するクラス
   #
-  class Task < Struct.new(:name, :opts, :block)
+  class Task < Struct.new(:name, :stdin, :files, :block)
     def self.tasks
       @tasks ||= Hash.new
     end
@@ -38,19 +38,11 @@ module Hose
       @require_envs ||= Hash.new
     end
 
-    def file_deps
-      @file_deps ||= begin
-        opts.each_with_object([]) do |(k, v), ret|
-          ret << k if v == :FILE
-        end
-      end
-    end
-
-    def pipe_deps
-      @pipe_deps ||= begin
-        opts.each_with_object([]) do |(k, v), ret|
-          ret << k if v == :STDIN
-        end
+    def deps
+      if stdin
+        [stdin, *files].uniq
+      else
+        files
       end
     end
   end
@@ -62,13 +54,13 @@ module Hose
     def run(thmap, tail_pids)
       FileUtils.touch File.join(dir, task.name + ".out")
       env = {}
-      task.file_deps.each do |name|
+      task.files.each do |name|
         env[name] = File.join(dir, "#{name}.out")
       end
 
       r, w = IO.pipe
-      if task.pipe_deps.size > 0
-        task_name = task.pipe_deps.first
+      if task.stdin
+        task_name = task.stdin
         file = File.join(dir, task_name + ".out")
         pid = Process.fork do
           r.close
@@ -83,11 +75,11 @@ module Hose
       r.close
       w.close
 
-      if task.file_deps.size > 0
+      if task.files.size > 0
         # プロセスの起動はそんなに速くないので、ここでSTOPで間に合う
         Process.kill :STOP, pid
         Thread.start do
-          task.file_deps.each do |name|
+          task.files.each do |name|
             thmap[name].value
           end
           Process.kill(:CONT, pid)
@@ -163,7 +155,7 @@ module Hose
       que = [task]
       dep_graph = {}
       while t = que.pop
-        deps = t.opts.keys
+        deps = t.deps
         deps.each do |dep|
           unless dep_graph.key? dep
             dep_task = Task.tasks[dep]
@@ -208,16 +200,18 @@ module Hose
   # Hosefileで利用できる関数群
   #
   module DSL
-    STDIN = :STDIN
-    FILE  = :FILE
-
     #
     # タスクの登録
     #
-    def task(name, opts = {}, &block)
+    def task(name, **opts, &block)
       name = name.to_s
-      opts = opts.map { |k,v| [k.to_s, v == ::STDIN ? DSL::STDIN : v ] }.to_h
-      Task.tasks[name] = Task.new(name, opts, block)
+
+      stdin = opts.delete(:in)
+      files = Array(opts.delete(:files))
+      if opts.size > 0
+        raise "不明なオプション #{opts.keys,join(', ')} @ #{name}"
+      end
+      Task.tasks[name] = Task.new(name, stdin, files, block)
     end
 
     #
@@ -240,7 +234,12 @@ module Hose
     end
 
     def show_tasks
-      puts Task.tasks.keys
+      Task.tasks.each do |key, t|
+        ary = []
+        ary << "STDIN: #{t.stdin}" if t.stdin
+        ary << "FILES: #{t.files.join(', ')}" unless t.files.empty?
+        puts "#{t.name}(#{ary.join(', ')}）"
+      end
     end
 
     def run(name, outfile)

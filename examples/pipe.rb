@@ -1,13 +1,13 @@
 task 'src' do
   bash <<-EOF
-    for i in $(seq 5); do
+    for i in $(seq 3); do
       echo $i
       sleep 1
     done
   EOF
 end
 
-task 'step1', src: STDIN do
+task 'step1', in: 'src' do
   bash <<-EOF
     echo step1 start
     while read -r line; do
@@ -17,7 +17,7 @@ task 'step1', src: STDIN do
   EOF
 end
 
-task 'step2', step1: STDIN do
+task 'step2', in: 'step1' do
   bash <<-EOF
     echo step2 start
     while read -r line; do
@@ -27,7 +27,7 @@ task 'step2', step1: STDIN do
   EOF
 end
 
-task 'final', step2: STDIN do
+task 'final', in: 'step2' do
   bash <<-EOF
     while read -r line; do
       echo "f> $line" >&2
