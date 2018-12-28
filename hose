@@ -189,7 +189,8 @@ module Hose
         if th.value.exitstatus != 0 && !killall
           # 初めて失敗したプロセスが見つかったときに、残りの全プロセスに TERM を送る
           killall = true
-          Process.kill :TERM, *thall.threads.find_all(&:alive?).map(&:pid)
+          pids = thall.threads.find_all(&:alive?).map(&:pid)
+          Process.kill :TERM, *pids if pids.size > 0
         end
       end
       return !killall
