@@ -31,7 +31,11 @@ module Hose
   #
   class Task < Struct.new(:name, :opts, :block)
     def self.tasks
-      @@tasks ||= Hash.new
+      @tasks ||= Hash.new
+    end
+
+    def self.require_envs
+      @require_envs ||= Hash.new
     end
 
     def file_deps
@@ -134,25 +138,30 @@ module Hose
     end
 
     def run(name, outfile)
+      Task.require_envs.keys.each do |key|
+        raise "環境変数 \"#{key}\" が設定されていません" unless ENV.has_key?(key)
+      end
+
       Process.setpgid(0, 0)
       list = task_list(name)
       Dir.mktmpdir do |tmpdir|
-        $stdout.puts tmpdir
+        $stdout.puts "#{tmpdir} (#{Process.pid})"
         thmap = {} # :: String -> Thread::Detach
         list.each do |name|
           task = Task.tasks[name]
           TaskInstance.new(task, tmpdir).run(thmap)
         end
-        if wait_finish(thmap.values)
-          if outfile
-            src = File.join(tmpdir, "#{list.last}.out")
-            if outfile == '-'
-              File.open(src, 'r') do |f|
-                $stdout.write f.read
-              end
-            else
-              FileUtils.cp src, outfile
+        all_ok = wait_finish(thmap.values)
+        raise '完了できませんでした' unless all_ok
+
+        if outfile
+          src = File.join(tmpdir, "#{list.last}.out")
+          if outfile == '-'
+            File.open(src, 'r') do |f|
+              $stdout.write f.read
             end
+          else
+            FileUtils.cp src, outfile
           end
         end
       end
@@ -209,10 +218,20 @@ module Hose
     STDIN = :STDIN
     FILE  = :FILE
 
+    #
+    # タスクの登録
+    #
     def task(name, opts = {}, &block)
       name = name.to_s
       opts = opts.map { |k,v| [k.to_s, v == ::STDIN ? DSL::STDIN : v ] }.to_h
       Task.tasks[name] = Task.new(name, opts, block)
+    end
+
+    #
+    # 実行に必要な環境変数の存在確認
+    #
+    def check_env(name)
+      Task.require_envs[name.to_s] = true
     end
   end
 
