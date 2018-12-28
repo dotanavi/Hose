@@ -26,11 +26,14 @@ class Hash
 end
 
 module Hose
+  #
+  # Hosefileで定義されるタスクを表現するクラス
+  #
   class Task < Struct.new(:name, :opts, :block)
     def self.tasks
       @@tasks ||= Hash.new
     end
-  
+
     def file_deps
       @file_deps ||= begin
         opts.each_with_object([]) do |(k, v), ret|
@@ -38,7 +41,7 @@ module Hose
         end
       end
     end
-  
+
     def pipe_deps
       @pipe_deps ||= begin
         opts.each_with_object([]) do |(k, v), ret|
@@ -48,20 +51,17 @@ module Hose
     end
   end
 
-  class TaskInstance < Struct.new(:task, :dir)  
+  #
+  # Taskの実行時情報
+  #
+  class TaskInstance < Struct.new(:task, :dir)
     TAIL = /darwin/i =~ Etc.uname[:sysname] ? 'gtail' : 'tail'
-  
-    def outfile
-      File.join(dir, task.name + ".out")
-    end
-  
-    def run(pmap)
-      FileUtils.touch(outfile)
-  
+
+    def run(thmap)
       stdin = File::NULL
       if task.pipe_deps.size > 0
         task_name = task.pipe_deps.first
-        pid = pmap[task_name].pid
+        pid = thmap[task_name].pid
         file = File.join(dir, "#{task_name}.out")
         stdin = IO.popen([TAIL, "--pid=#{pid}", '-f', file])
       end
@@ -77,7 +77,7 @@ module Hose
         Process.kill :STOP, pid
         Thread.start do
           task.file_deps.each do |name|
-            pmap[name].value
+            thmap[name].value
           end
           Process.kill(:CONT, pid)
         end
@@ -85,18 +85,21 @@ module Hose
 
       detach = Process.detach(pid)
       detach.name = task.name
-      pmap[task.name] = detach
+      thmap[task.name] = detach
     end
 
     def run_after_fork(env, stdin)
-      ENV.update(env)
-      $stdin.reopen(stdin)
-      $stdout.reopen(outfile, 'w')
-      # $stderr.reopen(File.join(dir, task.name + ".err"), 'w')
-      ok = instance_eval(&task.block)
-      exit(ok ? 0 : 1)
+      outfile = File.join(dir, task.name + ".out")
+      File.open(outfile, 'w') do |stdout|
+        ENV.update(env)
+        $stdin.reopen(stdin)
+        $stdout.reopen(stdout)
+        # $stderr.reopen(File.join(dir, task.name + ".err"), 'w')
+        ok = instance_eval(&task.block)
+        exit(ok ? 0 : 1)
+      end
     end
-  
+
     def bash(src)
       fname = File.join(dir, task.name + ".bash")
       File.write(fname, src)
@@ -104,6 +107,9 @@ module Hose
     end
   end
 
+  #
+  # 一連の流れを制御するクラス
+  #
   class TaskRunner
     def self.run(name, outfile)
       self.new.run(name, outfile)
@@ -114,12 +120,12 @@ module Hose
       list = task_list(name)
       Dir.mktmpdir do |tmpdir|
         $stdout.puts tmpdir
-        pmap = {} # :: String -> Thread::Detach
+        thmap = {} # :: String -> Thread::Detach
         list.each do |name|
           task = Task.tasks[name]
-          TaskInstance.new(task, tmpdir).run(pmap)
+          TaskInstance.new(task, tmpdir).run(thmap)
         end
-        if wait_finish(pmap.values)
+        if wait_finish(thmap.values)
           if outfile
             src = File.join(tmpdir, "#{list.last}.out")
             if outfile == '-'
@@ -139,7 +145,7 @@ module Hose
     def task_list(name)
       task = Task.tasks[name]
       raise "タスク #{name} とが見つかりません" unless task
-  
+
       que = [task]
       dep_graph = {}
       while t = que.pop
@@ -177,7 +183,7 @@ module Hose
       end
     end
   end
-  
+
   #
   # Hosefileで利用できる関数群
   #
@@ -192,6 +198,9 @@ module Hose
     end
   end
 
+  #
+  # main の中から呼ばれるコマンド
+  #
   module Command
     module_function
 
