@@ -59,7 +59,7 @@ module Hose
   # Taskの実行時情報
   #
   class TaskInstance < Struct.new(:task, :dir)
-    def run(thmap)
+    def run(thmap, tail_pids)
       FileUtils.touch File.join(dir, task.name + ".out")
       env = {}
       task.file_deps.each do |name|
@@ -67,11 +67,21 @@ module Hose
       end
 
       r, w = IO.pipe
+      if task.pipe_deps.size > 0
+        task_name = task.pipe_deps.first
+        file = File.join(dir, task_name + ".out")
+        pid = Process.fork do
+          r.close
+          exec('tail', '-f', file, out: w)
+        end
+        tail_pids[task_name] << pid
+      end
       pid = Process.fork do
         w.close
         run_after_fork(env, r)
       end
       r.close
+      w.close
 
       if task.file_deps.size > 0
         # プロセスの起動はそんなに速くないので、ここでSTOPで間に合う
@@ -86,31 +96,6 @@ module Hose
       detach = Process.detach(pid)
       detach.name = task.name
       thmap[task.name] = detach
-
-      if task.pipe_deps.size > 0
-        task_name = task.pipe_deps.first
-        tailf(thmap, task_name, w)
-      else
-        w.close
-      end
-    end
-
-    def tailf(thmap, name, w)
-      th = thmap[name]
-      Thread.start do
-        File.open(File.join(dir, name + ".out")) do |f|
-          while th.alive?
-            begin
-              w.print f.readline
-            rescue EOFError
-              sleep 0.1
-            end
-          end
-          w.print f.read
-          w.close
-          $stderr.puts "tail end #{name}"
-        end
-      end
     end
 
     def run_after_fork(env, stdin)
@@ -148,11 +133,12 @@ module Hose
       Dir.mktmpdir do |tmpdir|
         $stdout.puts "#{tmpdir} (#{Process.pid})"
         thmap = {} # :: String -> Thread::Detach
+        tail_pids = Hash.new{|h,k| h[k] = [] }
         list.each do |name|
           task = Task.tasks[name]
-          TaskInstance.new(task, tmpdir).run(thmap)
+          TaskInstance.new(task, tmpdir).run(thmap, tail_pids)
         end
-        all_ok = wait_finish(thmap.values)
+        all_ok = wait_finish(thmap.values, tail_pids)
         raise '完了できませんでした' unless all_ok
 
         if outfile
@@ -190,13 +176,18 @@ module Hose
       return dep_graph.tsort
     end
 
-    def wait_finish(threads)
+    def wait_finish(threads, tail_pids)
       killall = false
       thall = ThreadsWait.new(*threads)
       until thall.empty?
         th = thall.next_wait
+        if tail_pids.has_key?(th.name)
+          # 今終わったプロセスの出力ファイルを tail しているプロセスに INT を送る
+          Process.kill :INT, *tail_pids[th.name]
+        end
         log_result(th.name, th.value.exitstatus == 0)
         if th.value.exitstatus != 0 && !killall
+          # 初めて失敗したプロセスが見つかったときに、残りの全プロセスに TERM を送る
           killall = true
           Process.kill :TERM, *thall.threads.find_all(&:alive?).map(&:pid)
         end
