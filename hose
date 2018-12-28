@@ -1,0 +1,253 @@
+#!/usr/bin/env ruby
+USAGE = <<EOF
+依存関係を気にしながらタスクを実行します
+
+Usage:
+  #{$0} <TASK> [OPTIONS]
+
+OPTIONS:
+  -C <FILE>   Hosefileを指定します。省略した場合、カレントディレクトリから読み込みます
+  -T, --tasks タスク一覧を表示します
+
+EOF
+
+require 'etc'
+require 'fileutils'
+require 'thwait'
+require 'tmpdir'
+require 'tsort'
+
+class Hash
+  include TSort
+  alias tsort_each_node each_key
+  def tsort_each_child(node, &block)
+    fetch(node).each(&block)
+  end
+end
+
+module Hose
+  class Task < Struct.new(:name, :opts, :block)
+    def self.tasks
+      @@tasks ||= Hash.new
+    end
+  
+    def file_deps
+      @file_deps ||= begin
+        opts.each_with_object([]) do |(k, v), ret|
+          ret << k if v == :FILE
+        end
+      end
+    end
+  
+    def pipe_deps
+      @pipe_deps ||= begin
+        opts.each_with_object([]) do |(k, v), ret|
+          ret << k if v == :STDIN
+        end
+      end
+    end
+  end
+
+  class TaskInstance < Struct.new(:task, :dir)  
+    TAIL = /darwin/i =~ Etc.uname[:sysname] ? 'gtail' : 'tail'
+  
+    def outfile
+      File.join(dir, task.name + ".out")
+    end
+  
+    def run(pmap)
+      FileUtils.touch(outfile)
+  
+      stdin = File::NULL
+      if task.pipe_deps.size > 0
+        task_name = task.pipe_deps.first
+        pid = pmap[task_name].pid
+        file = File.join(dir, "#{task_name}.out")
+        stdin = IO.popen([TAIL, "--pid=#{pid}", '-f', file])
+      end
+
+      env = {}
+      task.file_deps.each do |name|
+        env[name] = File.join(dir, "#{name}.out")
+      end
+
+      pid = Process.fork { run_after_fork(env, stdin) }
+      if task.file_deps.size > 0
+        # プロセスの起動はそんなに速くないので、ここでSTOPで間に合う
+        Process.kill :STOP, pid
+        Thread.start do
+          task.file_deps.each do |name|
+            pmap[name].value
+          end
+          Process.kill(:CONT, pid)
+        end
+      end
+
+      detach = Process.detach(pid)
+      detach.name = task.name
+      pmap[task.name] = detach
+    end
+
+    def run_after_fork(env, stdin)
+      ENV.update(env)
+      $stdin.reopen(stdin)
+      $stdout.reopen(outfile, 'w')
+      # $stderr.reopen(File.join(dir, task.name + ".err"), 'w')
+      ok = instance_eval(&task.block)
+      exit(ok ? 0 : 1)
+    end
+  
+    def bash(src)
+      fname = File.join(dir, task.name + ".bash")
+      File.write(fname, src)
+      system('bash', fname)
+    end
+  end
+
+  class TaskRunner
+    def self.run(name, outfile)
+      self.new.run(name, outfile)
+    end
+
+    def run(name, outfile)
+      Process.setpgid(0, 0)
+      list = task_list(name)
+      Dir.mktmpdir do |tmpdir|
+        $stdout.puts tmpdir
+        pmap = {} # :: String -> Thread::Detach
+        list.each do |name|
+          task = Task.tasks[name]
+          TaskInstance.new(task, tmpdir).run(pmap)
+        end
+        if wait_finish(pmap.values)
+          if outfile
+            src = File.join(tmpdir, "#{list.last}.out")
+            if outfile == '-'
+              File.open(src, 'r') do |f|
+                $stdout.write f.read
+              end
+            else
+              FileUtils.cp src, outfile
+            end
+          end
+        end
+      end
+    end
+
+    private
+
+    def task_list(name)
+      task = Task.tasks[name]
+      raise "タスク #{name} とが見つかりません" unless task
+  
+      que = [task]
+      dep_graph = {}
+      while t = que.pop
+        deps = t.opts.keys
+        deps.each do |dep|
+          unless dep_graph.key? dep
+            dep_task = Task.tasks[dep]
+            raise "タスク #{dep} が見つかりません（#{t.name} が依存）" unless dep_task
+            que.push dep_task
+          end
+        end
+        dep_graph[t.name] = deps
+      end
+      return dep_graph.tsort
+    end
+
+    def wait_finish(threads)
+      killall = false
+      thall = ThreadsWait.new(*threads)
+      until thall.empty?
+        th = thall.next_wait
+        log_result(th.name, th.value.exitstatus == 0)
+        if th.value.exitstatus != 0 && !killall
+          killall = true
+          Process.kill :TERM, *thall.threads.filter(&:alive?).map(&:pid)
+        end
+      end
+      return !killall
+    end
+
+    def log_result(name, success)
+      if $stdout.tty?
+        mark = success ? ("\e[32m%s\e[m" % "✓") : ("\e[31m%s\e[m" % "☓")
+        $stderr.puts "#{mark} #{name}"
+      end
+    end
+  end
+  
+  #
+  # Hosefileで利用できる関数群
+  #
+  module DSL
+    STDIN = :STDIN
+    FILE  = :FILE
+
+    def task(name, opts = {}, &block)
+      name = name.to_s
+      opts = opts.map { |k,v| [k.to_s, v == ::STDIN ? DSL::STDIN : v ] }.to_h
+      Task.tasks[name] = Task.new(name, opts, block)
+    end
+  end
+
+  module Command
+    module_function
+
+    def usage
+      puts USAGE
+      exit 1
+    end
+
+    def show_tasks
+      puts Task.tasks.keys
+    end
+
+    def run(name, outfile)
+      TaskRunner.run(name, outfile)
+    end
+  end
+
+  module_function
+
+  #
+  # エントリーポイント
+  #
+  def main
+    return Command.usage if ARGV.empty?
+
+    hosefile = nil
+    task_name = nil
+    show_task = false
+    outfile   = nil
+
+    args = ARGV.clone
+    while args.size > 0
+      arg = args.shift
+      case arg
+      when '-C'            ; hosefile = args.shift
+      when '-o', '--output'; outfile = args.shift
+      when '-T', '--tasks' ; show_task = true
+      when /^-/            ; raise "不明なオプション: #{arg}"
+      else                 ; task_name = arg
+      end
+    end
+    if hosefile == nil
+      hosefile = %w(Hosefile hosefile hosefile.rb).find{ |f| File.exist? f }
+      raise 'Hosefileが見つかりません' unless hosefile
+    end
+    Object.__send__(:include, Hose::DSL)
+    load hosefile
+    return Command::show_tasks if show_task
+
+    raise 'タスク名が指定されていません' unless task_name
+    Command::run(task_name, outfile)
+
+  rescue RuntimeError => e
+    $stderr.puts e.message
+    exit 1
+  end
+end
+
+Hose::main
