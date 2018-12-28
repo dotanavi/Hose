@@ -108,6 +108,7 @@ module Hose
           end
           w.print f.read
           w.close
+          $stderr.puts "tail end #{name}"
         end
       end
     end
