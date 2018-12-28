@@ -55,23 +55,20 @@ module Hose
   # Taskの実行時情報
   #
   class TaskInstance < Struct.new(:task, :dir)
-    TAIL = /darwin/i =~ Etc.uname[:sysname] ? 'gtail' : 'tail'
-
     def run(thmap)
-      stdin = File::NULL
-      if task.pipe_deps.size > 0
-        task_name = task.pipe_deps.first
-        pid = thmap[task_name].pid
-        file = File.join(dir, "#{task_name}.out")
-        stdin = IO.popen([TAIL, "--pid=#{pid}", '-f', file])
-      end
-
+      FileUtils.touch File.join(dir, task.name + ".out")
       env = {}
       task.file_deps.each do |name|
         env[name] = File.join(dir, "#{name}.out")
       end
 
-      pid = Process.fork { run_after_fork(env, stdin) }
+      r, w = IO.pipe
+      pid = Process.fork do
+        w.close
+        run_after_fork(env, r)
+      end
+      r.close
+
       if task.file_deps.size > 0
         # プロセスの起動はそんなに速くないので、ここでSTOPで間に合う
         Process.kill :STOP, pid
@@ -82,22 +79,43 @@ module Hose
           Process.kill(:CONT, pid)
         end
       end
-
       detach = Process.detach(pid)
       detach.name = task.name
       thmap[task.name] = detach
+
+      if task.pipe_deps.size > 0
+        task_name = task.pipe_deps.first
+        tailf(thmap, task_name, w)
+      else
+        w.close
+      end
+    end
+
+    def tailf(thmap, name, w)
+      th = thmap[name]
+      Thread.start do
+        File.open(File.join(dir, name + ".out")) do |f|
+          while th.alive?
+            begin
+              w.print f.readline
+            rescue EOFError
+              sleep 0.1
+            end
+          end
+          w.print f.read
+          w.close
+        end
+      end
     end
 
     def run_after_fork(env, stdin)
       outfile = File.join(dir, task.name + ".out")
-      File.open(outfile, 'w') do |stdout|
-        ENV.update(env)
-        $stdin.reopen(stdin)
-        $stdout.reopen(stdout)
-        # $stderr.reopen(File.join(dir, task.name + ".err"), 'w')
-        ok = instance_eval(&task.block)
-        exit(ok ? 0 : 1)
-      end
+      ENV.update(env)
+      $stdin.reopen(stdin)
+      $stdout.reopen(outfile, 'w')
+      # $stderr.reopen(File.join(dir, task.name + ".err"), 'w')
+      ok = instance_eval(&task.block)
+      exit(ok ? 0 : 1)
     end
 
     def bash(src)
@@ -170,7 +188,7 @@ module Hose
         log_result(th.name, th.value.exitstatus == 0)
         if th.value.exitstatus != 0 && !killall
           killall = true
-          Process.kill :TERM, *thall.threads.filter(&:alive?).map(&:pid)
+          Process.kill :TERM, *thall.threads.find_all(&:alive?).map(&:pid)
         end
       end
       return !killall
