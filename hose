@@ -96,8 +96,13 @@ module Hose
       $stdin.reopen(stdin)
       $stdout.reopen(outfile, 'w')
       # $stderr.reopen(File.join(dir, task.name + ".err"), 'w')
-      ok = instance_eval(&task.block)
-      exit(ok ? 0 : 1)
+      begin
+        ok = instance_eval(&task.block)
+        exit(ok ? 0 : 1)
+      rescue => e
+        $stderr.puts e.message
+        exit 1
+      end
     end
 
     def bash(src)
